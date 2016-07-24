@@ -739,6 +739,26 @@ class MultistreamsBZ2Test(unittest.TestCase):
         self.cleanup_temp_bz2(test_file)
 
 
+class SshScpSFtpTest(unittest.TestCase):
+    """
+    Test Ssh & Scp & SFtp
+
+    """
+    def test_read_file(self):
+        """Test Read File"""
+        print("TEST READ FILE")
+        print("TEST READ FILE")
+        print("TEST READ FILE")
+        return True
+
+    def test_write_file(self):
+        """Test Write File"""
+        print("TEST WRITE FILE")
+        print("TEST WRITE FILE")
+        print("TEST WRITE FILE")
+        return True
+
+
 if __name__ == '__main__':
     logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.DEBUG)
     unittest.main()
