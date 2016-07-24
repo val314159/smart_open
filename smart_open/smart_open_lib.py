@@ -26,6 +26,7 @@ import os
 import subprocess
 import sys
 import requests
+import io
 if sys.version_info[0] == 2:
     import httplib
 elif sys.version_info[0] == 3:
@@ -38,15 +39,17 @@ logger = logging.getLogger(__name__)
 
 # Multiprocessing is unavailable in App Engine (and possibly other sandboxes).
 # The only method currently relying on it is s3_iter_bucket, which is instructed
-# not to use it by the NO_MULTIPROCESSING flag.
+# whether to use it by the MULTIPROCESSING flag.
+MULTIPROCESSING = False
 try:
     import multiprocessing.pool
+    MULTIPROCESSING = True
 except ImportError:
     logger.warning("multiprocessing could not be imported and won't be used")
-    NO_MULTIPROCESSING = True
     from itertools import imap
-else:
-    NO_MULTIPROCESSING = False
+
+import gzipstream
+
 
 S3_MIN_PART_SIZE = 50 * 1024**2  # minimum part size for S3 multipart uploads
 WEBHDFS_MIN_PART_SIZE = 50 * 1024**2  # minimum part size for HDFS multipart uploads
@@ -137,13 +140,25 @@ def smart_open(uri, mode="rb", **kw):
             return sopen(parsed_uri.uri_path[1:], mode)
 
         elif parsed_uri.scheme in ("s3", "s3n"):
-            s3_connection = boto.connect_s3(aws_access_key_id=parsed_uri.access_id, aws_secret_access_key=parsed_uri.access_secret)
+            # Get an S3 host. It is required for sigv4 operations.
+            host = kw.pop('host', None)
+            if not host:
+                host = boto.config.get('s3', 'host', 's3.amazonaws.com')
+
+            # For credential order of precedence see
+            # http://boto.cloudhackers.com/en/latest/boto_config_tut.html#credentials
+            s3_connection = boto.connect_s3(
+                aws_access_key_id=parsed_uri.access_id,
+                host=host,
+                aws_secret_access_key=parsed_uri.access_secret,
+                profile_name=kw.pop('profile_name', None))
+
             bucket = s3_connection.get_bucket(parsed_uri.bucket_id)
             if mode in ('r', 'rb'):
                 key = bucket.get_key(parsed_uri.key_id)
                 if key is None:
                     raise KeyError(parsed_uri.key_id)
-                return S3OpenRead(key, **kw)
+                return S3OpenRead(key)
             elif mode in ('w', 'wb'):
                 key = bucket.get_key(parsed_uri.key_id, validate=False)
                 if key is None:
@@ -171,7 +186,7 @@ def smart_open(uri, mode="rb", **kw):
         if mode in ('r', 'rb'):
             return S3OpenRead(uri)
         elif mode in ('w', 'wb'):
-            return S3OpenWrite(uri)
+            return S3OpenWrite(uri, **kw)
     elif hasattr(uri, 'read'):
         # simply pass-through if already a file-like
         return uri
@@ -224,6 +239,8 @@ class ParseUri(object):
             self.uri_path = parsed_uri.path
         elif self.scheme == "webhdfs":
             self.uri_path = parsed_uri.netloc + "/webhdfs/v1" + parsed_uri.path
+            if parsed_uri.query:
+                self.uri_path += "?" + parsed_uri.query
 
             if not self.uri_path:
                 raise RuntimeError("invalid WebHDFS URI: %s" % uri)
@@ -260,9 +277,114 @@ class ParseUri(object):
             raise NotImplementedError("unknown URI scheme %r in %r" % (self.scheme, uri))
 
 
+def is_gzip(name):
+    """Return True if the name indicates that the file is compressed with
+    gzip."""
+    return name.endswith(".gz")
+
+
+class _S3ReadStream(object):
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.unused_buffer = b''
+        self.closed = False
+        self.finished = False
+
+    def read_until_eof(self):
+        #
+        # This method is here because boto.s3.Key.read() reads the entire
+        # file, which isn't expected behavior.
+        #
+        # https://github.com/boto/boto/issues/3311
+        #
+        buf = b""
+        while not self.finished:
+            raw = self.stream.read(io.DEFAULT_BUFFER_SIZE)
+            if len(raw) > 0:
+                buf += raw
+            else:
+                self.finished = True
+        return buf
+
+    def read_from_buffer(self, size):
+        part = self.unused_buffer[:size]
+        self.unused_buffer = self.unused_buffer[size:]
+        return part
+
+    def read(self, size=None):
+        if not size or size < 0:
+            return self.unused_buffer + self.read_until_eof()
+
+        # Use unused data first
+        if len(self.unused_buffer) > size:
+            return self.read_from_buffer(size)
+
+        # If the stream is finished and no unused raw data, return what we have
+        if self.stream.closed or self.finished:
+            self.finished = True
+            buf, self.unused_buffer = self.unused_buffer, b''
+            return buf
+
+        # Consume new data in chunks and return it.
+        while len(self.unused_buffer) < size:
+            raw = self.stream.read(io.DEFAULT_BUFFER_SIZE)
+            if len(raw):
+                self.unused_buffer += raw
+            else:
+                self.finished = True
+                break
+
+        return self.read_from_buffer(size)
+
+    def readinto(self, b):
+        # Read up to len(b) bytes into bytearray b
+        # Sadly not as efficient as lower level
+        data = self.read(len(b))
+        if not data:
+            return None
+        b[:len(data)] = data
+        return len(data)
+
+    def readable(self):
+        # io.BufferedReader needs us to appear readable
+        return True
+
+    def _checkReadable(self, msg=None):
+        # This is required to satisfy io.BufferedReader on Python 2.6.
+        # Another way to achieve this is to inherit from io.IOBase, but that
+        # leads to other problems.
+        return True
+
+
+class S3ReadStream(io.BufferedReader):
+
+    def __init__(self, key):
+        self.stream = _S3ReadStream(key)
+        super(S3ReadStream, self).__init__(self.stream)
+
+    def read(self, *args, **kwargs):
+        # Patch read to return '' instead of raise Value Error
+        try:
+            return super(S3ReadStream, self).read(*args, **kwargs)
+        except ValueError:
+            return ''
+
+    def readline(self, *args, **kwargs):
+        # Patch readline to return '' instead of raise Value Error
+        try:
+            result = super(S3ReadStream, self).readline(*args, **kwargs)
+            return result
+        except ValueError:
+            return ''
+
+
 class S3OpenRead(object):
     """
     Implement streamed reader from S3, as an iterable & context manager.
+
+    Supports reading from gzip-compressed files.  Identifies such files by
+    their extension.
 
     """
     def __init__(self, read_key):
@@ -270,29 +392,27 @@ class S3OpenRead(object):
                 and not hasattr(read_key, "close"):
             raise TypeError("can only process S3 keys")
         self.read_key = read_key
-        self.line_generator = s3_iter_lines(self.read_key)
+        self._open_reader()
+
+    def _open_reader(self):
+        if is_gzip(self.read_key.name):
+            self.reader = gzipstream.GzipStreamFile(self.read_key)
+        else:
+            self.reader = S3ReadStream(self.read_key)
 
     def __iter__(self):
-        key = self.read_key.bucket.get_key(self.read_key.name)
-        if key is None:
-            raise KeyError(self.read_key.name)
+        for line in self.reader:
+            yield line
 
-        return s3_iter_lines(key)
+    def readline(self):
+        return self.reader.readline()
 
     def read(self, size=None):
         """
         Read a specified number of bytes from the key.
 
-        Note read() and line iteration (`for line in self: ...`) each have their
-        own file position, so they are independent. Doing a `read` will not affect
-        the line iteration, and vice versa.
-
         """
-        if not size or size < 0:
-            # For compatibility with standard Python, `read(negative)` = read the rest of the file.
-            # Otherwise, boto would read *from the start* if given size=-1.
-            size = 0
-        return self.read_key.read(size)
+        return self.reader.read(size)
 
     def seek(self, offset, whence=0):
         """
@@ -304,12 +424,13 @@ class S3OpenRead(object):
         if whence != 0 or offset != 0:
             raise NotImplementedError("seek other than offset=0 not implemented yet")
         self.read_key.close(fast=True)
+        self._open_reader()
 
     def __enter__(self):
         return self
 
     def __exit__(self, type, value, traceback):
-        self.read_key.close()
+        self.read_key.close(fast=True)
 
     def __str__(self):
         return "%s<key: %s>" % (
@@ -454,6 +575,9 @@ class S3OpenWrite(object):
         if not hasattr(outkey, "bucket") and not hasattr(outkey, "name"):
             raise TypeError("can only process S3 keys")
 
+        if is_gzip(outkey.name):
+            raise NotImplementedError("streaming write to S3 gzip not supported")
+
         self.outkey = outkey
         self.min_part_size = min_part_size
 
@@ -516,9 +640,11 @@ class S3OpenWrite(object):
         else:
             # AWS complains with "The XML you provided was not well-formed or did not validate against our published schema"
             # when the input is completely empty => abort the upload, no file created
-            # TODO: or create the empty file some other way?
             logger.info("empty input, ignoring multipart upload")
             self.outkey.bucket.cancel_multipart_upload(self.mp.key_name, self.mp.id)
+            # So, instead, create an empty file like this
+            logger.info("setting an empty value for the key")
+            self.outkey.set_contents_from_string('')
 
     def __enter__(self):
         return self
@@ -641,7 +767,7 @@ def s3_iter_bucket(bucket, prefix='', accept_key=lambda key: True, key_limit=Non
 
     The keys are processed in parallel, using `workers` processes (default: 16),
     to speed up downloads greatly. If multiprocessing is not available, thus
-    NO_MULTIPROCESSING is True, this parameter will be ignored.
+    MULTIPROCESSING is False, this parameter will be ignored.
 
     Example::
 
@@ -659,13 +785,13 @@ def s3_iter_bucket(bucket, prefix='', accept_key=lambda key: True, key_limit=Non
     total_size, key_no = 0, -1
     keys = (key for key in bucket.list(prefix=prefix) if accept_key(key.name))
 
-    if NO_MULTIPROCESSING:
-        logger.info("iterating over keys from %s without multiprocessing" % bucket)
-        iterator = imap(s3_iter_bucket_process_key, keys)
-    else:
+    if MULTIPROCESSING:
         logger.info("iterating over keys from %s with %i workers" % (bucket, workers))
         pool = multiprocessing.pool.Pool(processes=workers)
         iterator = pool.imap_unordered(s3_iter_bucket_process_key, keys)
+    else:
+        logger.info("iterating over keys from %s without multiprocessing" % bucket)
+        iterator = imap(s3_iter_bucket_process_key, keys)
 
     for key_no, (key, content) in enumerate(iterator):
         if key_no % 1000 == 0:
@@ -680,43 +806,10 @@ def s3_iter_bucket(bucket, prefix='', accept_key=lambda key: True, key_limit=Non
             # we were asked to output only a limited number of keys => we're done
             break
 
-    if not NO_MULTIPROCESSING:
+    if MULTIPROCESSING:
         pool.terminate()
 
     logger.info("processed %i keys, total size %i" % (key_no + 1, total_size))
-
-
-def s3_iter_lines(key):
-    """
-    Stream an object from S3 line by line (generator).
-
-    `key` must be a `boto.key.Key` object.
-
-    """
-    # check valid object on input
-    if not isinstance(key, boto.s3.key.Key):
-        raise TypeError("expected boto.key.Key object on input")
-
-    buf = b''
-    # keep reading chunks of bytes into the buffer
-    for chunk in key:
-        buf += chunk
-
-        start = 0
-        # process all lines within the current buffer
-        while True:
-            end = buf.find(b'\n', start) + 1
-            if end:
-                yield buf[start : end]
-                start = end
-            else:
-                # no more newlines => break out to read more data from s3 into the buffer
-                buf = buf[start : ]
-                break
-
-    # process the last line, too
-    if buf:
-        yield buf
 
 
 class WebHdfsException(Exception):

@@ -1,13 +1,13 @@
 language: python
-notifications:
-  email: false
 python:
 - "2.7"
 - "2.6"
 - "3.3"
 - "3.4"
+- "3.5"
 install:
 - if [[ $TRAVIS_PYTHON_VERSION == 2.6 ]]; then pip install ordereddict; fi
-- pip install httpretty==0.8.10 requests==2.8.1 mock moto responses
+- pip install mock moto responses
 - python setup.py install
+- pip freeze
 script: python -W ignore setup.py test
