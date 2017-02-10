@@ -723,3 +723,16 @@ class WebHdfsException(Exception):
     def __init__(self, msg=str()):
         self.msg = msg
         super(WebHdfsException, self).__init__(self.msg)
+
+
+def smart_listdir(dir):
+    if not dir.startswith('s3://'):
+        return os.listdir(dir)
+    arr = dir.split('/', 3)
+    bucketname, key = arr[2], arr[3]
+    results = set()
+    bucket = boto.connect_s3().get_bucket(bucketname)
+    for key, content in s3_iter_bucket(bucket, prefix=key):
+        results.add(str(key.name[len(key)+1:].split('/')[0]))
+        pass
+    return list(results)
